@@ -65,7 +65,7 @@ Diffusion models do **not** need the node: `pick_operations` builds their ops wi
 Clone into your ComfyUI `custom_nodes` directory and restart:
 
 ```bash
-git clone https://github.com/JoaoZaokk/comfy-convrot-w4a4 ComfyUI/custom_nodes/comfy-convrot-w4a4
+git clone https://github.com/JoaoZaokk/ComfyUI-ConvRot-W4A4 ComfyUI/custom_nodes/ComfyUI-ConvRot-W4A4
 ```
 
 No dependencies beyond what ComfyUI already ships. The converter additionally uses `psutil`,

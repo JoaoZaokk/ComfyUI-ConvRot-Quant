@@ -1,5 +1,5 @@
 [project]
-name = "comfy-convrot-w4a4"
+name = "comfyui-convrot-w4a4"
 description = "ConvRot W4A4 converter for ComfyUI checkpoints, plus the node that makes quantized text encoders actually run the native INT4 kernel."
 version = "0.1.0"
 license = { file = "LICENSE" }
@@ -7,7 +7,7 @@ requires-python = ">=3.10"
 dependencies = ["psutil"]
 
 [project.urls]
-Repository = "https://github.com/JoaoZaokk/comfy-convrot-w4a4"
+Repository = "https://github.com/JoaoZaokk/ComfyUI-ConvRot-W4A4"
 
 [tool.comfy]
 PublisherId = "joaozaokk"
