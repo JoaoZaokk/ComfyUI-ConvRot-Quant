@@ -122,18 +122,59 @@ land on code 0. Entropy of the codes is 2.825 bits of the 3.907 paid. That is a 
 though not the total one it is sometimes described as — the "one bit per channel" framing
 overstates it.
 
-One consequence matters for anyone planning a fix. Finer scaling alone does not close the gap:
-int4 at one scale per 16 channels still sits at 0.0815, **8.9× worse than plain per-token int8**.
-15 levels is the binding constraint, not the scale granularity. So SVDQuant — whose weight-side
-grouping is per-64, *coarser* than the 16 measured here — cannot work through granularity. Its
-low-rank bf16 branch, which subtracts the outlier before int4 ever sees it, has to be the part
-doing the work.
+Finer scaling alone does not close the gap: int4 at one scale per 16 channels still sits at
+0.0815, **8.9× worse than plain per-token int8**. 15 levels is the binding constraint, not the
+scale granularity — and that has a closed form. After the Hadamard rotation the values are close
+to Gaussian, so a group of `n` samples has `E[max]/σ ≈ 2` at `n = 16` and `≈ 4.2` across a full
+row. Uniform quantization error is `step/√12` with `step = max/7`, which gives 0.083σ and 0.17σ —
+the two measured numbers. Reaching int8's 0.0095σ would need a group whose max is 0.23σ, and no
+group of Gaussian samples has a max that small. Even a group of **two** lands around 0.04σ, four
+times worse than per-token int8. There is no group size that rescues int4.
+
+### So can SVDQuant rescue it?
+
+`tools/svdquant_probe.py` runs the recipe arithmetically before anyone writes a kernel. comfy-kitchen
+ships the SVDQuant *runtime* but none of its weight-side inputs (`smooth`, `lora_down`, `lora_up`,
+grouped `wscales`), so the question is whether building that calibration pass would pay. Metric is
+the **layer output** `x @ W.T` against the bf16 source, using activations captured mid-generation —
+not activation error alone, since SVDQuant deliberately trades weight error for activation error.
+
+| | layer-output relative L2 | vs shipped W4A4 |
+| --- | --- | --- |
+| ConvRot W4A4, as shipped | 0.1763 | 1.00× |
+| per-group-64 scales, both operands | 0.1448 | 1.22× |
+| SmoothQuant channel migration only | 0.0981 | 1.80× |
+| per-group-64 **+** smoothing | 0.0802 | 2.20× |
+| **+ rank-32 branch — full SVDQuant** | **0.0713** | **2.47×** |
+| **asym_w4a8_int8, as shipped** | **0.0553** | **3.19×** |
+
+Two results, and the first corrects an earlier claim in this README. The **low-rank branch is the
+smallest of the three ingredients**, not the essential one: it contributes 1.12× on top of
+smoothing and grouping, where smoothing alone contributes 1.79×. Smoothing works because it is the
+only step that changes the *distribution* rather than the scale — it drops the activation's
+worst-channel-to-median ratio from 321 to 13.4, which is exactly the term the closed form above
+depends on. `α` was swept over 0.3–0.9 and the optimum sits at 0.65 (0.0802) with 0.5 nearly tied,
+so tuning it does not change the picture.
+
+Second: **the full recipe is still 1.29× worse than asym_w4a8_int8, which already exists and
+already works.** Weeks of calibration work to land behind a format you can convert to today.
+
+The one cheap thing worth taking from this: SmoothQuant's `λ` can be folded into the preceding
+RMSNorm weight for `q/k/v_proj` and `gate/up_proj` — five of the seven projections — at literally
+zero runtime cost and with no kernel change, since the existing ConvRot path never sees it.
+`o_proj` and `down_proj` have no norm directly ahead of them and would need an explicit elementwise
+multiply. That buys the 1.80× row, from a converter change plus an activation-statistics
+calibration pass. It does not reach W4A8, and per-layer error is not end-to-end quality, but it is
+the only rung on this ladder whose cost is measured in days rather than weeks.
 
 ## Components
 
 - **`tools/quant_w4a8.py`** — converter for comfy-kitchen's `asym_w4a8_int8`. **Recommended.**
 - **`tools/quant_w4a4.py`** — converter for `convrot_w4a4`. Kept as a fixture; see above.
 - **`tools/verify_w4a4.py`** — metadata, layout, byte-for-byte source comparison and a real kernel run.
+- **`tools/svdquant_probe.py`** — runs the SmoothQuant / grouped-scale / low-rank ablation above
+  on real captured activations against the bf16 source weights, so the recipe can be priced before
+  any kernel is written.
 - **`tools/activation_balance.py`** — hooks the live ConvRot kernel and measures the real
   activations it is handed: per-channel outlier ratio, effective bits, and the int4/int8 round-trip
   ladder above.
