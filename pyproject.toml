@@ -1,15 +1,17 @@
 [project]
-name = "comfyui-convrot-w4a4"
-description = "ConvRot W4A4 converter for ComfyUI checkpoints, plus the node that makes quantized text encoders actually run the native INT4 kernel."
+name = "ComfyUI-ConvRot-Quant"
+description = "4-bit quantization for ComfyUI checkpoints that actually runs its kernel: an asym_w4a8_int8 converter (recommended), a ConvRot W4A4 converter kept as a fixture, torch.compile repairs, and the node that stops quantized text encoders from silently dequantizing."
 version = "0.1.0"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = ["psutil"]
 
 [project.urls]
-Repository = "https://github.com/JoaoZaokk/ComfyUI-ConvRot-W4A4"
+Repository = "https://github.com/JoaoZaokk/ComfyUI-ConvRot-Quant"
 
 [tool.comfy]
 PublisherId = "joaozaokk"
-DisplayName = "ConvRot W4A4"
+DisplayName = "ConvRot Quant"
 Icon = ""
+
+

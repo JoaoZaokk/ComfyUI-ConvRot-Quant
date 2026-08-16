@@ -1,15 +1,68 @@
-# ComfyUI ConvRot W4A4
+# ComfyUI ConvRot Quant
 
-Convert high-precision ComfyUI checkpoints to ConvRot W4A4 and make them actually execute the
-native INT4 tensor-core kernel instead of quietly dequantizing back to a full-precision GEMM.
+4-bit quantization for ComfyUI checkpoints that actually executes its kernel instead of quietly
+dequantizing back to a full-precision GEMM — plus the measurements showing which 4-bit format is
+worth using.
 
-Two pieces:
+**Use `tools/quant_w4a8.py`. Do not use W4A4.** That is not a style preference; it is what the
+numbers said.
 
-- **`tools/quant_w4a4.py`** — a converter that writes ComfyUI-native `convrot_w4a4` safetensors.
-- **The `ConvRot W4A4 Native (Text Encoder)` node** — a fix for text encoders, where stock
-  ComfyUI stores the quantized weights but never runs the kernel.
+![FP16 vs ConvRot W4A4 vs asym_w4a8_int8](docs/w4a4_vs_w4a8.png)
 
-Tested on an RTX 3090 (SM86) with ComfyUI `0.29.0`, comfy-kitchen `0.2.23`, Torch `2.12.1+cu130`.
+HunyuanVideo 1.5, RTX 3090, identical prompt, seed, steps, resolution, sampler and scheduler.
+Model resident, seeds varied so ComfyUI could not serve a cached result. Times are ComfyUI's own
+`Prompt executed`.
+
+| Format | Time | VRAM staged | On disk | Image |
+| --- | --- | --- | --- | --- |
+| FP16 source | **2.94 s** | 15881 MB | 15.51 GiB | correct |
+| ConvRot W4A4 | 4.85 s | 8113 MB | 7.92 GiB | **destroyed** |
+| **asym_w4a8_int8** | **4.61 s** | 8437 MB | 8.24 GiB | **correct** |
+
+ConvRot W4A4 is slower than FP16 *and* destroys the output, so its VRAM saving buys nothing. W4A8
+is faster than W4A4 and produces a correct image for 4% more disk: **1.57x slower than FP16 for
+1.88x less VRAM**, which is a real trade.
+
+W4A4 was tested at Hadamard group sizes 256, 64 and 16. All three are unusable; the parameter does
+not rescue it. The ConvRot paper reports 2.26x speedup on FLUX.1-dev; that did not reproduce here.
+
+The W4A4 converter is kept because the format is a useful fixture for kernel and loader work, and
+because a negative result with a reproduction is worth more than silence.
+
+## Why 4-bit activations break a diffusion model
+
+Both formats keep 4-bit **weights**. The one that works keeps 8-bit **activations**. That is the
+axis that matters, and the likely reason is structural rather than numerical.
+
+An autoregressive LLM ends every step with a discrete projection — argmax or a sample over a
+vocabulary. A small perturbation in the logits usually selects the same token, so quantization
+error is repeatedly snapped away, and the next step starts from an exactly-representable state. A
+diffusion model has no such projection. The latent is continuous, and each denoising step feeds its
+error straight into the next. Over several steps there is nothing to correct it.
+
+W4A8 adds three defences on top of the same ConvRot rotation:
+
+- activations stay at 8 bits, where Ampere's INT8 tensor-core path is mature and its INT4 path is not
+- per-group scales (`group_size=16`) instead of one scale per row — on a `[8192, 2048]` layer that
+  is 128 scales per row rather than 1
+- a Lloyd-Max codebook, so the 16 int4 levels stop being uniformly spaced and are placed where the
+  weights actually are
+
+That last one is worth dwelling on: comfy-kitchen decides whether to build the codebook using a
+**kurtosis probe** on the weight distribution. Uniform int4 levels assume the weights are evenly
+spread; they are not, and the tails are exactly where the damage happens. Measuring that spread is
+already part of the library.
+
+## Components
+
+- **`tools/quant_w4a8.py`** — converter for comfy-kitchen's `asym_w4a8_int8`. **Recommended.**
+- **`tools/quant_w4a4.py`** — converter for `convrot_w4a4`. Kept as a fixture; see above.
+- **`tools/verify_w4a4.py`** — metadata, layout, byte-for-byte source comparison and a real kernel run.
+- **The `ConvRot W4A4 Native (Text Encoder)` node** — for text encoders, where stock ComfyUI stores
+  quantized weights but never runs the kernel.
+- **`compile_support.py`** — three runtime fixes that make `torch.compile` work at all.
+
+Tested on an RTX 3090 (SM86) with ComfyUI `0.33.0`, comfy-kitchen `0.2.31`, Torch `2.13.0+cu130`.
 
 ## The problem this solves
 
@@ -91,7 +144,7 @@ whole model.
 Clone into your ComfyUI `custom_nodes` directory and restart:
 
 ```bash
-git clone https://github.com/JoaoZaokk/ComfyUI-ConvRot-W4A4 ComfyUI/custom_nodes/ComfyUI-ConvRot-W4A4
+git clone https://github.com/JoaoZaokk/ComfyUI-ConvRot-Quant ComfyUI/custom_nodes/ComfyUI-ConvRot-Quant
 ```
 
 No dependencies beyond what ComfyUI already ships. The converter additionally uses `psutil`,
@@ -176,3 +229,4 @@ producing a checkpoint that can only ever run dequantized.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
