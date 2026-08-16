@@ -40,24 +40,56 @@ error is repeatedly snapped away, and the next step starts from an exactly-repre
 diffusion model has no such projection. The latent is continuous, and each denoising step feeds its
 error straight into the next. Over several steps there is nothing to correct it.
 
-W4A8 adds three defences on top of the same ConvRot rotation:
+Part of the gap, though, is already visible in the **weights**, before any activation is
+quantized at all. `tools/weight_balance.py` measures it as an ablation ladder over one weight,
+each rung adding a single defence, scored by the relative L2 error of a quantize → dequantize
+round trip. Ten layers sampled evenly from each model:
 
-- activations stay at 8 bits, where Ampere's INT8 tensor-core path is mature and its INT4 path is not
-- per-group scales (`group_size=16`) instead of one scale per row — on a `[8192, 2048]` layer that
-  is 128 scales per row rather than 1
-- a Lloyd-Max codebook, so the 16 int4 levels stop being uniformly spaced and are placed where the
-  weights actually are
+| | HunyuanVideo 1.5 | Gemma 3 12B |
+| --- | --- | --- |
+| A — uniform int4, one scale per row, no rotation | 0.1696 | 0.1894 |
+| B — uniform int4, one scale per row, + ConvRot **(= W4A4)** | 0.1556 | 0.1667 |
+| C — uniform int4, per-group-16 scale, + ConvRot | 0.0852 | 0.0852 |
+| D — Lloyd-Max int4, per-group-16 + ALS, + ConvRot **(= W4A8)** | **0.0731** | **0.0731** |
 
-That last one is worth dwelling on: comfy-kitchen decides whether to build the codebook using a
-**kurtosis probe** on the weight distribution. Uniform int4 levels assume the weights are evenly
-spread; they are not, and the tails are exactly where the damage happens. Measuring that spread is
-already part of the library.
+W4A4's weights alone are already **2.1–2.3× further from the source** than W4A8's. The dominant
+term is not the codebook and not the rotation — it is **scale granularity**. One absmax per row
+means the scale is set by that row's largest weight, and the crest factor `max|w| / rms` is 12.7
+on HunyuanVideo and 28.0 on Gemma. A typical weight therefore lands a few percent up a 15-level
+grid, and the Shannon entropy of the code histogram bears it out: W4A4 recovers **2.90–2.98 bits
+of the 4 it pays**, while per-group-16 recovers 3.74 of a possible 3.907.
+
+Rotation contributes far less than its billing: it moves the error only 8–12%, and mean excess
+kurtosis barely shifts (1.44 → 1.09 on HunyuanVideo, 1.69 → 1.73 on Gemma). What rotation buys is
+*downstream* — after per-group normalization the distribution lands at −0.49 excess kurtosis in
+both models, near-Gaussian, which is what lets one frozen 16-level table fit every layer.
+
+That last point corrects something an earlier version of this README claimed. comfy-kitchen's
+**kurtosis probe** does not choose the codebook per layer; it is an escape hatch, and it never
+fires. The gate trips above −0.10 and real layers sit at −0.49, so the shipped Lloyd-Max LUT — a
+fixed, non-uniformly-spaced table — is applied unconditionally. The non-uniformity is an
+assumption baked into the format, not a per-model decision.
+
+The measurement also **refutes** the obvious explanation for why LLMs survive 4 bits and
+diffusion models do not. Gemma's weights are not better balanced than HunyuanVideo's — they are
+**worse**, on every axis: higher kurtosis (median 1.09 vs 0.44), more than double the crest
+factor (24.5 vs 11.8), fewer effective bits under W4A4. The LLM carries the more hostile weight
+distribution and still survives. So weight imbalance explains the W4A4-vs-W4A8 gap *within* a
+model, and does not explain the LLM-vs-diffusion gap at all — which leaves the discrete-projection
+argument above standing by elimination.
+
+What is still unmeasured here is the **activation** side, which is the other half of A4 vs A8 and
+plausibly the larger half. That needs a forward pass, not a header read.
 
 ## Components
 
 - **`tools/quant_w4a8.py`** — converter for comfy-kitchen's `asym_w4a8_int8`. **Recommended.**
 - **`tools/quant_w4a4.py`** — converter for `convrot_w4a4`. Kept as a fixture; see above.
 - **`tools/verify_w4a4.py`** — metadata, layout, byte-for-byte source comparison and a real kernel run.
+- **`tools/weight_balance.py`** — measures weight imbalance and the ablation ladder above. Reads
+  only weights, no inference. Self-checking: rung B is computed independently *and* through
+  comfy-kitchen's own `quantize/dequantize_convrot_w4a4_weight`, and the run reports the drift
+  (0.0001 on both models above) so the other rungs can be trusted.
 - **The `ConvRot W4A4 Native (Text Encoder)` node** — for text encoders, where stock ComfyUI stores
   quantized weights but never runs the kernel.
 - **`compile_support.py`** — three runtime fixes that make `torch.compile` work at all.
