@@ -57,8 +57,9 @@ QUESTIONS = [
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--text-encoder", action="append", required=True,
-                        help="file name inside models/text_encoders, repeatable")
+    parser.add_argument("--text-encoder", action="append", default=[],
+                        help="file name inside models/text_encoders, repeatable. Optional only "
+                             "because a run may consist entirely of the other modes below.")
     parser.add_argument("--force-dequant", action="append", default=[],
                         help="checkpoint name to run with weights retyped so ComfyUI dequantizes "
                              "them, giving 4-bit weights with full-precision activations")
@@ -182,13 +183,24 @@ def main() -> int:
     counters = instrument()
     set_convrot_int8(False)
 
-    runs = [(name, False) for name in args.text_encoder]
-    runs += [(name, True) for name in args.force_dequant]
+    # (checkpoint, dequantize weights?, mode) -- one row of the weight-format x activation-precision
+    # matrix per entry, and the mode decides which activation precision that row runs at.
+    runs = [(name, False, "native") for name in args.text_encoder]
+    runs += [(name, True, "native") for name in args.force_dequant]
+    runs += [(name, False, "convrot-int8") for name in args.convrot_int8]
+    runs += [(name, True, "emulate-a4") for name in args.emulate_a4]
+    if not runs:
+        raise SystemExit("Nothing to run: pass at least one of --text-encoder, --force-dequant, "
+                         "--convrot-int8 or --emulate-a4")
+    tags = {"native": "", "convrot-int8": "   [linear_dtype=int8 -> A8]",
+            "emulate-a4": "   [dequantized weights + emulated A4]"}
     results = []
-    for name, dequant in runs:
-        label = f"{name}{'   [force-dequant -> W4A16]' if dequant else ''}"
+    for name, dequant, mode in runs:
+        suffix = "   [force-dequant -> W4A16]" if dequant and mode == "native" else tags[mode]
+        label = f"{name}{suffix}"
         print(f"\n{'=' * 78}\n{label}\n{'-' * 78}", flush=True)
-        result = run_checkpoint(name, dequant, args, counters)
+        set_convrot_int8(mode == "convrot-int8")
+        result = run_checkpoint(name, dequant, args, counters, mode)
         results.append(result)
         print(f"  -> {result['passed']}/{result['total']}   "
               f"native {result['native_linear_calls']}  dequant {result['weight_dequant_calls']}",

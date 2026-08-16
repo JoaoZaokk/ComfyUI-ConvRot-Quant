@@ -159,6 +159,39 @@ so tuning it does not change the picture.
 Second: **the full recipe is still 1.29× worse than asym_w4a8_int8, which already exists and
 already works.** Weeks of calibration work to land behind a format you can convert to today.
 
+### The matrix: which axis actually decides
+
+Scoring one checkpoint against another confounds two variables at once, because the W4A4 and W4A8
+files do not share a weight quantizer. Separating them needs weight format crossed with activation
+precision. Five of the six cells run natively: `--force-dequant` gives A16, and
+`convrot_w4a4_linear(..., linear_dtype="int8")` is an existing kernel branch that keeps the int4
+ConvRot weights and quantizes activations to int8 instead. Only Lloyd-Max-weights-with-A4 has no
+native path and is emulated by injecting ConvRot's exact int4 activation round trip.
+
+Scores out of 8. **The fp8 checkpoint also scores 5/8**, failing the same three questions with the
+same wrong answers (`4133` for 47×89, `Cidadões`), so **5 is the ceiling** — those three are the
+model, not the quantizer.
+
+| weights | A4 | A8 | A16 |
+| --- | --- | --- | --- |
+| **ConvRot** — one absmax per row, uniform 15 levels | 1/8 | 1/8 | 3/8 |
+| **Lloyd-Max per-group-16** | 4/8 *(emulated)* | **5/8** | **5/8** |
+
+Read the rows, not the diagonal. With a good weight quantizer, dropping activations to **8 bits
+costs nothing at all** — 5/8 against 5/8, identical answers question by question — and dropping
+them to **4 bits costs exactly one question**. With ConvRot's weights, the model is broken at every
+activation precision, and A16 only lifts it to 3/8.
+
+So the weight quantizer, not the activation precision, decides whether the model works. `A4` on
+good weights lands at 80% of the ceiling; `A4` on ConvRot weights produces
+`Kangróángëngüëëëëëèlílílí`. This revises the earlier framing in this README: the error *ratios*
+said activations were nine times the weight problem, and the error ratios were measuring the wrong
+thing. An error norm ranks recipes; it does not tell you which one still answers questions.
+
+Two caveats that the numbers do not carry. The Lloyd/A4 cell is emulated, so it is not strictly
+comparable to the native rows. And eight questions cannot resolve 1/8 against 1/8 — the ConvRot row
+being flat across A4 and A8 may be a floor effect rather than a finding.
+
 ### The smoothing row was built, and it does not survive a battery
 
 The paragraph that used to sit here recommended folding SmoothQuant's `λ` into the preceding
