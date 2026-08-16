@@ -29,18 +29,36 @@ not rescue it. The ConvRot paper reports 2.26x speedup on FLUX.1-dev; that did n
 The W4A4 converter is kept because the format is a useful fixture for kernel and loader work, and
 because a negative result with a reproduction is worth more than silence.
 
-## Why 4-bit activations break a diffusion model
+## What actually breaks: the activations, in both model families
 
-Both formats keep 4-bit **weights**. The one that works keeps 8-bit **activations**. That is the
-axis that matters, and the likely reason is structural rather than numerical.
+Both formats keep 4-bit **weights**. The one that works keeps 8-bit **activations**. It is easy to
+assume this is something about diffusion — that a continuous latent accumulates error where an
+LLM's discrete token choice snaps it away each step. That story is wrong, and `tools/gemma_chat.py`
+kills it in one run.
 
-An autoregressive LLM ends every step with a discrete projection — argmax or a sample over a
-vocabulary. A small perturbation in the logits usually selects the same token, so quantization
-error is repeatedly snapped away, and the next step starts from an exactly-representable state. A
-diffusion model has no such projection. The latent is continuous, and each denoising step feeds its
-error straight into the next. Over several steps there is nothing to correct it.
+Gemma 3 12B, greedy decoding, identical prompt, through ComfyUI's own loader and generation loop.
+The middle row is the same W4A4 checkpoint as the bottom row — identical 4-bit weights, byte for
+byte — with the weights retyped so `comfy/ops.py` dequantizes them instead of dispatching the
+kernel. Only the activation precision differs:
 
-Part of the gap, though, is already visible in the **weights**, before any activation is
+| | weights | activations | kernel | VRAM | answer to "list the first 8 primes" |
+| --- | --- | --- | --- | --- | --- |
+| BF16 source | 16 | 16 | — | 21.92 GiB | `2, 3, 5, 7, 11, 13, 17, 19` ✅ |
+| W4A16 *(same W4A4 file, dequantized)* | **4** | 16 | 18144 dequants | 7.60 GiB | `2, 3, 5, 7, 11, 13, 17, 19` ✅ |
+| asym_w4a8_int8 | **4** | 8 | 19824 native | 8.16 GiB | `2, 3, 5, 7, 11, 13, 17, 19` ✅ |
+| ConvRot W4A4 | **4** | **4** | 18480 native | 7.52 GiB | `the first -f including the number of the list: 1, 2, 3, 4, 5, 6, 7, 8` ❌ |
+
+The LLM does **not** survive 4-bit activations either. It survives 4-bit *weights* — at A16 and at
+A8 — which is what GPTQ, AWQ and GGUF `Q4` actually ship, and what "LLMs run fine at 4 bits" has
+always meant. Nobody runs W4A4 language models in production for the same reason this repo does not
+recommend W4A4 diffusion models.
+
+So there is no LLM-versus-diffusion divide to explain. Both model families tolerate 4-bit weights
+and both break on 4-bit activations. Every run above reports its native-kernel and dequantization
+counts, because a checkpoint that silently dequantizes is running a different experiment from the
+one you think you are running — that is exactly how the W4A16 row was produced on purpose.
+
+Part of the damage is visible in the **weights** alone, before any activation is
 quantized at all. `tools/weight_balance.py` measures it as an ablation ladder over one weight,
 each rung adding a single defence, scored by the relative L2 error of a quantize → dequantize
 round trip. Ten layers sampled evenly from each model:
@@ -70,22 +88,25 @@ fires. The gate trips above −0.10 and real layers sit at −0.49, so the shipp
 fixed, non-uniformly-spaced table — is applied unconditionally. The non-uniformity is an
 assumption baked into the format, not a per-model decision.
 
-The measurement also **refutes** the obvious explanation for why LLMs survive 4 bits and
-diffusion models do not. Gemma's weights are not better balanced than HunyuanVideo's — they are
-**worse**, on every axis: higher kurtosis (median 1.09 vs 0.44), more than double the crest
-factor (24.5 vs 11.8), fewer effective bits under W4A4. The LLM carries the more hostile weight
-distribution and still survives. So weight imbalance explains the W4A4-vs-W4A8 gap *within* a
-model, and does not explain the LLM-vs-diffusion gap at all — which leaves the discrete-projection
-argument above standing by elimination.
+![weight divergence, diffusion vs LLM](docs/weight_divergence.png)
 
-What is still unmeasured here is the **activation** side, which is the other half of A4 vs A8 and
-plausibly the larger half. That needs a forward pass, not a header read.
+The two models diverge sharply here — and in the direction opposite to the intuitive story.
+Gemma's weights are **worse** balanced than HunyuanVideo's on every axis: higher kurtosis (median
+1.09 vs 0.44), more than double the crest factor (24.5 vs 11.8), fewer effective bits under W4A4.
+The LLM carries the more hostile weight distribution. It still handles 4-bit weights fine, and it
+still breaks on 4-bit activations. Weight imbalance is a real and measurable cost — it is most of
+the W4A4-vs-W4A8 *weight* error — but it is not what decides whether a model survives.
 
 ## Components
 
 - **`tools/quant_w4a8.py`** — converter for comfy-kitchen's `asym_w4a8_int8`. **Recommended.**
 - **`tools/quant_w4a4.py`** — converter for `convrot_w4a4`. Kept as a fixture; see above.
 - **`tools/verify_w4a4.py`** — metadata, layout, byte-for-byte source comparison and a real kernel run.
+- **`tools/gemma_chat.py`** — chats with a Gemma 3 text encoder through ComfyUI's own loader and
+  generation loop, counting native kernel calls against dequantizations so you know which
+  precision actually ran. `--force-dequant` pins the same 4-bit weights to full-precision
+  activations, which is how the W4A16 row above was measured.
+- **`tools/plot_weight_balance.py`** — draws the figure above from two checkpoints.
 - **`tools/weight_balance.py`** — measures weight imbalance and the ablation ladder above. Reads
   only weights, no inference. Self-checking: rung B is computed independently *and* through
   comfy-kitchen's own `quantize/dequantize_convrot_w4a4_weight`, and the run reports the drift
