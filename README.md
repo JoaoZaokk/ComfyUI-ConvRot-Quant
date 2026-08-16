@@ -159,6 +159,51 @@ so tuning it does not change the picture.
 Second: **the full recipe is still 1.29× worse than asym_w4a8_int8, which already exists and
 already works.** Weeks of calibration work to land behind a format you can convert to today.
 
+### Is it the level placement? No — that part is worth 8%
+
+Cohere ships `command-a-plus-05-2026-w4a4` as NVFP4: FP4 **E2M1** values, non-uniformly spaced
+(`0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6`) rather than int4's even `-7…7`, with one FP8-E4M3 scale per
+16 values and a global scale above it. The obvious hypothesis is that the non-uniform levels are
+what makes 4-bit activations survivable, since weights and activations are both dense near zero.
+
+`tools/svdquant_probe.py` implements NVFP4 faithfully — E2M1 levels, block-16, and the block scale
+**itself rounded to E4M3**, which is a real error source usually left out of comparisons — and
+scores it against a control with the same group size and uniform int4 levels:
+
+| | layer-output relative L2 | vs shipped W4A4 |
+| --- | --- | --- |
+| ConvRot W4A4, as shipped | 0.1763 | 1.00× |
+| int4 uniform, group-16, exact scale *(control)* | 0.0984 | 1.79× |
+| **E2M1, group-16, exact scale** | **0.0906** | 1.95× |
+| E2M1, group-16, E4M3 scale — **real NVFP4** | 0.0925 | 1.91× |
+| NVFP4 weights, int8 activations | 0.0681 | 2.59× |
+| **asym_w4a8_int8, as shipped** | **0.0553** | **3.19×** |
+
+Moving from uniform int4 to E2M1 at identical granularity buys **1.09×**, and storing the block
+scale in E4M3 hands 2% of that back. Net, NVFP4 beats plain int4 group-16 by 6%.
+
+Ranked by what actually moves, all measured against shipped W4A4:
+
+| ingredient | change | gain |
+| --- | --- | --- |
+| scale granularity, per-row → per-group-16 | 0.1763 → 0.0984 | **1.79×** |
+| SmoothQuant channel migration | 0.1763 → 0.0981 | **1.80×** |
+| activations 4-bit → 8-bit | 0.0925 → 0.0681 | 1.36× |
+| Lloyd-Max codebook + ALS scale refinement | 0.0681 → 0.0553 | 1.23× |
+| **E2M1 instead of uniform int4** | 0.0984 → 0.0906 | **1.09×** |
+
+So NVFP4's advantage is its **granularity and two-level scaling**, not its level placement. And
+`asym_w4a8_int8` — group-16, Lloyd-Max, ALS-refined scales, int8 activations — still beats full
+NVFP4 on both operands by 1.67×, using a converter that already exists.
+
+Worth noting what Cohere actually does, since "they ship W4A4 and it works" gets cited as proof
+that PTQ suffices. They quantize **the MoE experts only**, leaving Q/K/V/O, the KV cache and
+attention compute at full precision — and the model card describes
+**Quantization-Aware Distillation**: "the quantized student is trained to match the full-precision
+teacher's output distribution, with fake quantization operators in the forward pass and
+straight-through estimators on the backward." That is quantization-aware training. Better format,
+selective application, *and* training — all three.
+
 ### The matrix: which axis actually decides
 
 Scoring one checkpoint against another confounds two variables at once, because the W4A4 and W4A8

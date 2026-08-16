@@ -125,7 +125,7 @@ E2M1_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 E4M3_MAX = 448.0
 
 
-def nvfp4_quant(t: torch.Tensor, block: int = 16) -> torch.Tensor:
+def nvfp4_quant(t: torch.Tensor, block: int = 16, fp8_scale: bool = True) -> torch.Tensor:
     """NVFP4: E2M1 values, one FP8-E4M3 scale per 16, and a global scale above it.
 
     The two-level scaling is the part that is easy to skip and shouldn't be: the block scale is
@@ -136,7 +136,9 @@ def nvfp4_quant(t: torch.Tensor, block: int = 16) -> torch.Tensor:
     grouped = t.reshape(rows, cols // block, block)
     global_scale = (t.abs().max() / (E4M3_MAX * max(E2M1_LEVELS))).clamp(min=1e-12)
     block_scale = (grouped.abs().amax(dim=-1, keepdim=True) / max(E2M1_LEVELS) / global_scale)
-    block_scale = block_scale.clamp(min=1e-12).to(torch.float8_e4m3fn).float()
+    block_scale = block_scale.clamp(min=1e-12)
+    if fp8_scale:  # real NVFP4 stores the block scale in 8 bits; that rounding is a real cost
+        block_scale = block_scale.to(torch.float8_e4m3fn).float()
     effective = (block_scale * global_scale).clamp(min=1e-12)
     normalized = grouped / effective
     levels = torch.tensor(E2M1_LEVELS, device=t.device, dtype=t.dtype)
@@ -213,6 +215,14 @@ def measure_layer(name: str, x: torch.Tensor, w: torch.Tensor, args) -> dict:
     result["relL2_9_nvfp4_w_int8_act"] = rel_l2(
         exact, group_quant(x.float(), gs, limit=127) @ nvfp4_quant(w.float()).T)
     result["relL2_10_nvfp4_smooth"] = rel_l2(exact, nvfp4_linear(x_smooth, w_smooth))
+    # The control NVFP4 has to beat to justify itself: identical group size, identical two
+    # operands, uniform int4 levels instead of E2M1 and a full-precision scale instead of E4M3.
+    # Anything between rung 8 and this one is the level placement alone.
+    result["relL2_11_int4_g16"] = rel_l2(exact, grouped_linear(x.float(), w.float(), 16))
+    # Same as rung 8 but with an exact block scale, so rung 11 -> 12 is level placement alone
+    # and rung 12 -> 8 is the price of storing that scale in E4M3.
+    result["relL2_12_e2m1_exact_scale"] = rel_l2(
+        exact, nvfp4_quant(x.float(), fp8_scale=False) @ nvfp4_quant(w.float(), fp8_scale=False).T)
     return result
 
 
@@ -300,7 +310,9 @@ def main() -> int:
                        (f"7  + rank-{args.rank} branch  [full SVDQuant]", "relL2_7_full"),
                        ("8  NVFP4 E2M1 g16, weights AND acts", "relL2_8_nvfp4"),
                        ("9  NVFP4 weights, int8 acts        ", "relL2_9_nvfp4_w_int8_act"),
-                       ("10 NVFP4 both + SmoothQuant        ", "relL2_10_nvfp4_smooth")):
+                       ("10 NVFP4 both + SmoothQuant        ", "relL2_10_nvfp4_smooth"),
+                       ("11 int4 g16 both  [NVFP4 control]  ", "relL2_11_int4_g16"),
+                       ("12 E2M1 g16, exact scale           ", "relL2_12_e2m1_exact_scale")):
         value = mean(key)
         print(f"    {label}{value:>8.4f}   {baseline / max(value, 1e-9):>6.2f}x better than rung 1")
     print(f"\n  activation channel outlier ratio   "
