@@ -60,6 +60,32 @@ Diffusion models do **not** need the node: `pick_operations` builds their ops wi
 `full_precision_mm=False` and matching activations, and `convrot_w4a4` is never added to the
 `disabled` set, so they dispatch natively on their own.
 
+## torch.compile support
+
+Importing this package also repairs `torch.compile` for ConvRot W4A4, applied at runtime so a
+`pip install --upgrade comfy-kitchen` cannot silently revert it. Three independent defects, each
+verified separately and then together:
+
+| Defect | Symptom | Fix |
+| --- | --- | --- |
+| `convrot_w4a4_linear` is not an opaque custom op | `RuntimeError: Cannot access data pointer of Tensor (e.g. FakeTensor...)` — Dynamo traces into the CUDA kernel | `torch.library.custom_op` + `register_fake` |
+| `__tensor_unflatten__` drops `outer_size`/`outer_stride` | crash when input length changes between runs | adopt `outer_size`, forward the stride |
+| no `_stable_hash_for_caching` | a cached compiled artifact is reused across incompatible graphs, then `AttributeError: '_OpNamespace' ... has no attribute` | stable hash over layout, dtypes, shapes and non-tensor params |
+
+Measured on an RTX 3090, HunyuanVideo 1.5 ConvRot W4A4, with `site-packages` left pristine:
+compiled output `max_abs_diff 0.00000000` against eager, and a second call at a different sequence
+length also `0.00000000`.
+
+Note the first two are separate holes: **neither one alone makes `torch.compile` work.** Tested
+individually before being tested together. comfy-kitchen already registers ~37 other ops with
+`torch.library.custom_op` (`comfy_kitchen::adaln`, `::int8_linear`, `::scaled_mm_svdquant_w4a4`);
+ConvRot's linear was simply never added. The dynamic-shape half mirrors
+[comfy-kitchen PR #52](https://github.com/Comfy-Org/comfy-kitchen/pull/52), open since 2026-06-25.
+
+A single quantized Linear compiles to one opaque op, so expect no speedup from `torch.compile` at
+that granularity — the gain comes from fusing the surrounding norms, activations and RoPE across a
+whole model.
+
 ## Install
 
 Clone into your ComfyUI `custom_nodes` directory and restart:

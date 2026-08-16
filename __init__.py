@@ -28,6 +28,12 @@ import torch
 
 from comfy.quant_ops import QuantizedTensor
 
+from . import compile_support
+
+# Registering the ConvRot kernel as an opaque custom op is what lets torch.compile work at all;
+# doing it here rather than by editing site-packages means a comfy-kitchen upgrade cannot revert it.
+compile_support.apply()
+
 NATIVE_FORMATS = {"convrot_w4a4"}
 DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
 
