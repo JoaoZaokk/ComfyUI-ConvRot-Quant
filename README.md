@@ -159,19 +159,50 @@ so tuning it does not change the picture.
 Second: **the full recipe is still 1.29× worse than asym_w4a8_int8, which already exists and
 already works.** Weeks of calibration work to land behind a format you can convert to today.
 
-The one cheap thing worth taking from this: SmoothQuant's `λ` can be folded into the preceding
-RMSNorm weight for `q/k/v_proj` and `gate/up_proj` — five of the seven projections — at literally
-zero runtime cost and with no kernel change, since the existing ConvRot path never sees it.
-`o_proj` and `down_proj` have no norm directly ahead of them and would need an explicit elementwise
-multiply. That buys the 1.80× row, from a converter change plus an activation-statistics
-calibration pass. It does not reach W4A8, and per-layer error is not end-to-end quality, but it is
-the only rung on this ladder whose cost is measured in days rather than weeks.
+### The smoothing row was built, and it does not survive a battery
+
+The paragraph that used to sit here recommended folding SmoothQuant's `λ` into the preceding
+RMSNorm — free at runtime, no kernel change, worth the 1.80× row above. It was built
+(`tools/quant_w4a4_smooth.py`, calibrated on real activations, `λ` folded through Gemma's `(1 + w)`
+RMSNorm, 240 of 336 projections covered). Then it was tested, and the recommendation did not hold.
+
+`tools/quality_battery.py` asks eight questions with checkable answers under greedy decoding:
+
+| checkpoint | score | kernel |
+| --- | --- | --- |
+| ConvRot W4A4 | **1/8** | 164976 native |
+| ConvRot W4A4 **+ SmoothQuant** | **1/8** | 171696 native |
+| asym_w4a8_int8 | **5/8** | 15120 native |
+| W4A16 *(the W4A4 file, dequantized)* | 3/8 | 47040 dequants |
+
+Smoothing cut the activation's worst-channel-to-median ratio from 83 to 9.6 and cut layer-output
+error 1.80×, and answered exactly as many questions as not doing it at all. A single-prompt test
+had suggested otherwise — plain W4A4 answered `1, 2, 3, 4, 5, 6, 7, 8` while smoothed answered
+`2, 1, 3, 5, 7, 11, 13, 17` — and that ranking reversed on a reworded prompt. One prompt does not
+separate two damaged models.
+
+**Layer-output error is not quality.** An error norm can fall 1.80× while every bit of the
+remaining error sits in a direction the next layer is sensitive to. This repo now treats the error
+ladder as a way to *reject* recipes cheaply, never to accept one.
+
+The W4A16 row carries the other lesson. It has full-precision activations and still loses to W4A8,
+because it is the **ConvRot** weight file dequantized — per-row absmax, uniform 15 levels, 0.1556
+weight error — against W4A8's per-group-16 Lloyd-Max at 0.0731. Clean activations do not recover
+information the weight quantizer already destroyed. There are two independent axes here, not one,
+and the earlier framing of "the activations are almost the whole problem" understated the weight
+half.
 
 ## Components
 
 - **`tools/quant_w4a8.py`** — converter for comfy-kitchen's `asym_w4a8_int8`. **Recommended.**
 - **`tools/quant_w4a4.py`** — converter for `convrot_w4a4`. Kept as a fixture; see above.
 - **`tools/verify_w4a4.py`** — metadata, layout, byte-for-byte source comparison and a real kernel run.
+- **`tools/quality_battery.py`** — eight questions with checkable answers, greedy, across several
+  checkpoints, reporting native-kernel and dequantization counts per run. Also routes a
+  convrot_w4a4 file through `linear_dtype="int8"` and can inject an emulated int4 activation
+  round trip, which is how the weight-format-by-activation-precision matrix gets filled.
+- **`tools/quant_w4a4_smooth.py`** — builds the SmoothQuant-folded W4A4 checkpoint described
+  above. Kept because the negative result needs a reproduction.
 - **`tools/svdquant_probe.py`** — runs the SmoothQuant / grouped-scale / low-rank ablation above
   on real captured activations against the bf16 source weights, so the recipe can be priced before
   any kernel is written.

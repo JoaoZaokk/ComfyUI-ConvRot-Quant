@@ -119,6 +119,35 @@ def grouped_linear(x: torch.Tensor, w: torch.Tensor, group_size: int) -> torch.T
     return group_quant(x, group_size) @ group_quant(w, group_size).T
 
 
+# FP4 E2M1: 1 sign, 2 exponent, 1 mantissa. Non-uniform, dense near zero, sparse in the tail --
+# the opposite of int4's even spacing, and the whole reason NVFP4 exists.
+E2M1_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+E4M3_MAX = 448.0
+
+
+def nvfp4_quant(t: torch.Tensor, block: int = 16) -> torch.Tensor:
+    """NVFP4: E2M1 values, one FP8-E4M3 scale per 16, and a global scale above it.
+
+    The two-level scaling is the part that is easy to skip and shouldn't be: the block scale is
+    itself stored in 8 bits, so the global scale exists to keep every block scale inside E4M3's
+    range. Rounding the scale to E4M3 is a real error source and is reproduced here.
+    """
+    rows, cols = t.shape
+    grouped = t.reshape(rows, cols // block, block)
+    global_scale = (t.abs().max() / (E4M3_MAX * max(E2M1_LEVELS))).clamp(min=1e-12)
+    block_scale = (grouped.abs().amax(dim=-1, keepdim=True) / max(E2M1_LEVELS) / global_scale)
+    block_scale = block_scale.clamp(min=1e-12).to(torch.float8_e4m3fn).float()
+    effective = (block_scale * global_scale).clamp(min=1e-12)
+    normalized = grouped / effective
+    levels = torch.tensor(E2M1_LEVELS, device=t.device, dtype=t.dtype)
+    index = (normalized.abs().unsqueeze(-1) - levels).abs().argmin(dim=-1)
+    return (torch.sign(normalized) * levels[index] * effective).reshape(rows, cols)
+
+
+def nvfp4_linear(x: torch.Tensor, w: torch.Tensor, block: int = 16) -> torch.Tensor:
+    return nvfp4_quant(x, block) @ nvfp4_quant(w, block).T
+
+
 def smooth_vector(x: torch.Tensor, w: torch.Tensor, alpha: float) -> torch.Tensor:
     """SmoothQuant per-input-channel migration factor, clamped away from zero."""
     act_max = x.abs().amax(dim=0).clamp(min=1e-5)
@@ -176,6 +205,14 @@ def measure_layer(name: str, x: torch.Tensor, w: torch.Tensor, args) -> dict:
             "group_smooth": rel_l2(exact, grouped_linear(xs, ws, gs)),
         }
     result["alpha_sweep"] = sweep
+
+    # NVFP4, the format Cohere ships as "W4A4": E2M1 levels, block-16 E4M3 scales, global scale.
+    # Rung 9 keeps NVFP4 weights but int8 activations, to separate level placement from the
+    # activation precision it is usually bundled with.
+    result["relL2_8_nvfp4"] = rel_l2(exact, nvfp4_linear(x.float(), w.float()))
+    result["relL2_9_nvfp4_w_int8_act"] = rel_l2(
+        exact, group_quant(x.float(), gs, limit=127) @ nvfp4_quant(w.float()).T)
+    result["relL2_10_nvfp4_smooth"] = rel_l2(exact, nvfp4_linear(x_smooth, w_smooth))
     return result
 
 
@@ -260,7 +297,10 @@ def main() -> int:
                        ("4  asym_w4a8_int8, as shipped       ", "relL2_4_w4a8"),
                        (f"5  per-group-{args.svdquant_group} scales only, both sides", "relL2_5_group_only"),
                        (f"6  + SmoothQuant migration          ", "relL2_6_group_smooth"),
-                       (f"7  + rank-{args.rank} branch  [full SVDQuant]", "relL2_7_full")):
+                       (f"7  + rank-{args.rank} branch  [full SVDQuant]", "relL2_7_full"),
+                       ("8  NVFP4 E2M1 g16, weights AND acts", "relL2_8_nvfp4"),
+                       ("9  NVFP4 weights, int8 acts        ", "relL2_9_nvfp4_w_int8_act"),
+                       ("10 NVFP4 both + SmoothQuant        ", "relL2_10_nvfp4_smooth")):
         value = mean(key)
         print(f"    {label}{value:>8.4f}   {baseline / max(value, 1e-9):>6.2f}x better than rung 1")
     print(f"\n  activation channel outlier ratio   "
