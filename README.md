@@ -97,11 +97,46 @@ The LLM carries the more hostile weight distribution. It still handles 4-bit wei
 still breaks on 4-bit activations. Weight imbalance is a real and measurable cost — it is most of
 the W4A4-vs-W4A8 *weight* error — but it is not what decides whether a model survives.
 
+### The activation half, measured
+
+`tools/activation_balance.py` hooks the real kernel and measures the tensors it was actually
+handed, mid-generation. ConvRot's activation path is `quantize_signed_int4_rowwise(rotate(x))` —
+**one absmax scale per token**, spanning all 3840 channels, 15 uniform levels. 24 tensors sampled
+across the layers of Gemma 3 12B:
+
+| | relative L2 of the activation round trip |
+| --- | --- |
+| int4, one scale per token **(= W4A4)** | 0.1677 |
+| int4, one scale per 16 channels | 0.0815 |
+| int8, one scale per token **(= W4A8)** | **0.0092** |
+| int8, one scale per 16 channels | 0.0045 |
+
+The activation gap between W4A4 and W4A8 is **18.2×**. The weight gap between the same two formats
+is **2.1×**. The activations are not merely the other half of the problem, they are almost nine
+times the size of the weight half — which is why a checkpoint whose weights are only twice as
+coarse produces output that is not merely twice as bad.
+
+The cause is visible in the same run: the worst channel of an activation tensor is **147× the
+median channel**, so one column fixes the scale for the whole token and 25.1% of all activations
+land on code 0. Entropy of the codes is 2.825 bits of the 3.907 paid. That is a severe collapse,
+though not the total one it is sometimes described as — the "one bit per channel" framing
+overstates it.
+
+One consequence matters for anyone planning a fix. Finer scaling alone does not close the gap:
+int4 at one scale per 16 channels still sits at 0.0815, **8.9× worse than plain per-token int8**.
+15 levels is the binding constraint, not the scale granularity. So SVDQuant — whose weight-side
+grouping is per-64, *coarser* than the 16 measured here — cannot work through granularity. Its
+low-rank bf16 branch, which subtracts the outlier before int4 ever sees it, has to be the part
+doing the work.
+
 ## Components
 
 - **`tools/quant_w4a8.py`** — converter for comfy-kitchen's `asym_w4a8_int8`. **Recommended.**
 - **`tools/quant_w4a4.py`** — converter for `convrot_w4a4`. Kept as a fixture; see above.
 - **`tools/verify_w4a4.py`** — metadata, layout, byte-for-byte source comparison and a real kernel run.
+- **`tools/activation_balance.py`** — hooks the live ConvRot kernel and measures the real
+  activations it is handed: per-channel outlier ratio, effective bits, and the int4/int8 round-trip
+  ladder above.
 - **`tools/gemma_chat.py`** — chats with a Gemma 3 text encoder through ComfyUI's own loader and
   generation loop, counting native kernel calls against dequantizations so you know which
   precision actually ran. `--force-dequant` pins the same 4-bit weights to full-precision
