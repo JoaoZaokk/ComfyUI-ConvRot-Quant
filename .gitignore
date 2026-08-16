@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# never commit weights or conversion output
+*.safetensors
+*.safetensors.partial
+*.gguf
+*.ckpt
+*.bin
+*.pt
+*.pth
+*.quant.json
